@@ -78,7 +78,7 @@ Make sure you have the following installed:
 ## 1. Clone the Repository
 
 ```bash
-git clone https://github.com/naman-gupta-02/TechHire.git
+git clone https://github.com/jayminsheladia/TechHire.git
 cd TechHire
 ```
 
@@ -267,6 +267,6 @@ This project is intended for educational and learning purposes.
 
 # Author
 
-**Naman Gupta**
+**Jaymin Sheladia**
 
-GitHub: https://github.com/naman-gupta-02
+GitHub: https://github.com/jayminsheladia
