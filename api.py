@@ -4,7 +4,7 @@ import json as json_lib
 import re as re_module
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, or_, and_, func, text
@@ -12,17 +12,37 @@ from dotenv import load_dotenv
 from db.session import init_db, SessionLocal
 from db.models import JobListing
 from scraper.runner import refresh as run_refresh
+from core.redis_client import get_redis
+from core.cache import jobs_cache_key, cache_get, cache_set, cache_clear_prefix
+from core.ratelimit import get_client_ip, rate_limit, cooldown
 
 load_dotenv()
 
 app = FastAPI(title="TechHire API")
 
+_default_origins = "http://localhost:5173,http://127.0.0.1:5173"
+_allowed_origins = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+JOBS_CACHE_TTL = 45  # seconds
+
+
+def _configured_groq_key() -> Optional[str]:
+    """Returns GROQ_API_KEY, or None if it's unset or still a placeholder
+    value (any '.env.example' entry starts with 'your_')."""
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key or api_key.startswith("your_"):
+        return None
+    return api_key
 
 
 @app.on_event("startup")
@@ -137,6 +157,18 @@ def get_jobs(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    r = get_redis()
+    cache_key = jobs_cache_key({
+        "search": search, "skills": skills, "visa_only": visa_only,
+        "salary_min": salary_min, "salary_max": salary_max,
+        "work_modes": work_modes, "experience_levels": experience_levels,
+        "date_posted": date_posted, "seasons": seasons, "sort": sort,
+        "page": page, "page_size": page_size,
+    })
+    cached = cache_get(r, cache_key)
+    if cached is not None:
+        return cached
+
     with SessionLocal() as session:
         stmt = _build_query(
             search, skills, visa_only, salary_min, salary_max,
@@ -166,13 +198,15 @@ def get_jobs(
 
         jobs = session.scalars(stmt).all()
 
-        return {
+        result = {
             "jobs": [_job_to_dict(j) for j in jobs],
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": max(1, -(-total // page_size)),  # ceiling division
         }
+        cache_set(r, cache_key, result, JOBS_CACHE_TTL)
+        return result
 
 
 @app.get("/jobs/{job_id}")
@@ -211,6 +245,7 @@ async def _run_scrape_job():
             result=result,
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
+        cache_clear_prefix(get_redis(), "jobs:")
     except Exception as e:
         _scrape_state.update(
             status="error",
@@ -223,9 +258,20 @@ async def _run_scrape_job():
 
 
 @app.post("/scrape/refresh")
-async def trigger_refresh():
+async def trigger_refresh(x_admin_key: str = Header(default="")):
+    if ADMIN_API_KEY and x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Admin key required for this action")
+
     if _scrape_lock.locked():
         return {"status": "already_running"}
+
+    allowed, retry_after = cooldown(get_redis(), "cooldown:scrape-refresh", 900)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Refresh was triggered recently — try again in {retry_after}s",
+        )
+
     await _scrape_lock.acquire()
     asyncio.create_task(_run_scrape_job())
     return {"status": "started"}
@@ -271,10 +317,12 @@ _SYSTEM = (
     "Output only the requested paragraphs — no headers, no bullet points, no preamble."
 )
 
-# Three different models (all free on Groq) covering different angles
+# Three different models (all free on Groq) covering different angles.
+# Groq's currently available chat models are reasoning models by default —
+# see _reasoning_kwargs() below for why every call needs extra params.
 _VARIANTS = [
     (
-        "llama-3.3-70b-versatile",  # best quality — role & day-to-day
+        "openai/gpt-oss-120b",      # best quality — role & day-to-day
         "Summarize this job in exactly 3 short paragraphs for a CS Masters student:\n"
         "Paragraph 1: What the company does and what this role is about.\n"
         "Paragraph 2: What you will actually build or do day-to-day, and the tech stack.\n"
@@ -282,7 +330,7 @@ _VARIANTS = [
         "Be specific. No filler.",
     ),
     (
-        "qwen/qwen3-32b",           # different model — fit & growth angle
+        "qwen/qwen3.6-27b",         # different model — fit & growth angle
         "Summarize this job in exactly 3 short paragraphs:\n"
         "Paragraph 1: What makes this company and role interesting — product, scale, or mission.\n"
         "Paragraph 2: What a typical week looks like — responsibilities and tech used.\n"
@@ -291,7 +339,7 @@ _VARIANTS = [
         "Keep it tight.",
     ),
     (
-        "llama-3.1-8b-instant",     # fastest — practical / student-focused
+        "openai/gpt-oss-20b",       # fastest — practical / student-focused
         "Summarize this job posting in exactly 3 short paragraphs for someone deciding whether to apply:\n"
         "Paragraph 1: One-sentence pitch — role + company + why it matters.\n"
         "Paragraph 2: The core technical work and stack they will use.\n"
@@ -299,6 +347,19 @@ _VARIANTS = [
         "Be direct. Students want facts, not marketing.",
     ),
 ]
+
+
+def _reasoning_kwargs(model: str) -> dict:
+    """Groq's current chat models (gpt-oss, qwen3.6) are reasoning models by
+    default — left alone, they spend max_tokens on invisible chain-of-thought
+    and can return empty content. Pin them to minimal/no reasoning so
+    max_tokens goes to the actual answer instead. Param names/values are
+    model-family-specific per Groq's API."""
+    if model.startswith("openai/gpt-oss"):
+        return {"reasoning_effort": "low", "reasoning_format": "hidden"}
+    if model.startswith("qwen/"):
+        return {"reasoning_effort": "none"}
+    return {}
 
 _SYNTHESIS_PROMPT = (
     "Three different AI models each summarized the same job posting from a different angle. "
@@ -318,15 +379,19 @@ async def _call_groq(client, model: str, prompt: str, context: str) -> str:
     def _sync():
         resp = client.chat.completions.create(
             model=model,
-            max_tokens=350,
+            max_tokens=600,
             temperature=0.4,
             messages=[
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": f"{prompt}\n\n---JOB---\n{context}"},
             ],
+            **_reasoning_kwargs(model),
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
     return await loop.run_in_executor(None, _sync)
+
+
+_SYNTHESIS_MODEL = "openai/gpt-oss-120b"
 
 
 async def _synthesize_groq(client, summaries: list[str], context: str) -> str:
@@ -337,8 +402,8 @@ async def _synthesize_groq(client, summaries: list[str], context: str) -> str:
     loop = asyncio.get_event_loop()
     def _sync():
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=500,
+            model=_SYNTHESIS_MODEL,
+            max_tokens=800,
             temperature=0.3,
             messages=[
                 {"role": "system", "content": _SYSTEM},
@@ -351,15 +416,16 @@ async def _synthesize_groq(client, summaries: list[str], context: str) -> str:
                     ),
                 },
             ],
+            **_reasoning_kwargs(_SYNTHESIS_MODEL),
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
     return await loop.run_in_executor(None, _sync)
 
 
 @app.get("/jobs/{job_id}/summary")
 async def get_job_summary(job_id: int, refresh: bool = False):
-    api_key = os.getenv("GROQ_API_KEY", "")
-    if not api_key or api_key == "your_key_here":
+    api_key = _configured_groq_key()
+    if not api_key:
         raise HTTPException(
             status_code=503,
             detail="GROQ_API_KEY not configured. Add it to your .env file. Get a free key at console.groq.com"
@@ -526,10 +592,18 @@ def _extract_json(text: str) -> dict:
 
 
 @app.post("/resume/analyze")
-async def analyze_resume(req: ResumeRequest):
-    api_key = os.getenv("GROQ_API_KEY", "")
-    if not api_key or api_key == "your_groq_api_key_here":
+async def analyze_resume(req: ResumeRequest, request: Request):
+    api_key = _configured_groq_key()
+    if not api_key:
         raise HTTPException(503, "GROQ_API_KEY not configured — add it to .env")
+
+    client_ip = get_client_ip(request)
+    allowed, retry_after = rate_limit(get_redis(), f"ratelimit:resume-analyze:{client_ip}", limit=5, window_seconds=600)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit reached for resume analysis — try again in {retry_after}s",
+        )
 
     job_desc = (req.job_description or "").strip()
 
@@ -552,16 +626,18 @@ async def analyze_resume(req: ResumeRequest):
     loop   = asyncio.get_event_loop()
 
     def _sync():
+        model = "openai/gpt-oss-120b"
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=2000,
+            model=model,
+            max_tokens=3000,
             temperature=0.1,
             messages=[
                 {"role": "system", "content": _RESUME_SYSTEM},
                 {"role": "user",   "content": prompt},
             ],
+            **_reasoning_kwargs(model),
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
 
     try:
         raw    = await loop.run_in_executor(None, _sync)
