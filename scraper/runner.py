@@ -1,7 +1,7 @@
 import time
 from datetime import datetime
 from sqlalchemy import select
-from scraper import indeed, glassdoor, handshake, lever
+from scraper import indeed, glassdoor, handshake, lever, greenhouse, ashby
 from scraper.utils import filter_alive
 from db.session import init_db, SessionLocal
 from db.models import JobListing
@@ -39,11 +39,39 @@ SCRAPE_CONFIGS = [
     ("Handshake", handshake, {"query": "entry level engineer",     "location": "remote", "max_pages": 3}),
     ("Handshake", handshake, {"query": "software engineer intern", "location": "remote", "max_pages": 3}),
 
-    # Full-time + intern roles — Lever
-    ("Lever",     lever,     {"query": "software engineer",        "location": "remote", "max_pages": 5}),
-    ("Lever",     lever,     {"query": "backend engineer",         "location": "remote", "max_pages": 3}),
-    ("Lever",     lever,     {"query": "fullstack engineer",       "location": "remote", "max_pages": 3}),
-    ("Lever",     lever,     {"query": "software engineer intern", "location": "remote", "max_pages": 3}),
+    # Real company job boards — Greenhouse (public API, no auth, no ToS issue)
+    ("Greenhouse", greenhouse, {"board": "stripe"}),
+    ("Greenhouse", greenhouse, {"board": "airbnb"}),
+    ("Greenhouse", greenhouse, {"board": "coinbase"}),
+    ("Greenhouse", greenhouse, {"board": "robinhood"}),
+    ("Greenhouse", greenhouse, {"board": "affirm"}),
+    ("Greenhouse", greenhouse, {"board": "gitlab"}),
+    ("Greenhouse", greenhouse, {"board": "asana"}),
+    ("Greenhouse", greenhouse, {"board": "brex"}),
+    ("Greenhouse", greenhouse, {"board": "pinterest"}),
+    ("Greenhouse", greenhouse, {"board": "reddit"}),
+    ("Greenhouse", greenhouse, {"board": "cloudflare"}),
+    ("Greenhouse", greenhouse, {"board": "figma"}),
+    ("Greenhouse", greenhouse, {"board": "databricks"}),
+    ("Greenhouse", greenhouse, {"board": "discord"}),
+    ("Greenhouse", greenhouse, {"board": "dropbox"}),
+    ("Greenhouse", greenhouse, {"board": "instacart"}),
+    ("Greenhouse", greenhouse, {"board": "lyft"}),
+    ("Greenhouse", greenhouse, {"board": "twitch"}),
+    ("Greenhouse", greenhouse, {"board": "datadog"}),
+    ("Greenhouse", greenhouse, {"board": "mongodb"}),
+    ("Greenhouse", greenhouse, {"board": "squarespace"}),
+
+    # Real company job board — Lever (public API, no auth, no ToS issue)
+    ("Lever", lever, {"board": "palantir"}),
+
+    # Real company job boards — Ashby (public API, no auth, no ToS issue)
+    ("Ashby", ashby, {"board": "ramp"}),
+    ("Ashby", ashby, {"board": "notion"}),
+    ("Ashby", ashby, {"board": "plaid"}),
+    ("Ashby", ashby, {"board": "linear"}),
+    ("Ashby", ashby, {"board": "openai"}),
+    ("Ashby", ashby, {"board": "hex"}),
 ]
 
 
@@ -53,7 +81,7 @@ def _scrape_all(existing_ids: set[str]) -> tuple[list, dict[str, int], bool]:
     quota_exceeded = False
 
     for name, module, kwargs in SCRAPE_CONFIGS:
-        label = f"{name} ({kwargs['query']})"
+        label = f"{name} ({kwargs.get('query') or kwargs.get('board')})"
         print(f"Fetching {label}...")
         try:
             jobs, hit_quota = module.fetch(existing_ids=existing_ids, **kwargs)
