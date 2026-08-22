@@ -1,7 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { formatSalary, getSkillClass, timeAgo, SOURCE_CLASS, SOURCE_LABEL, WORK_MODE_CLASS } from '../utils/format'
-
-const API_BASE = 'http://localhost:8000'
+import { API_BASE } from '../utils/api'
 
 function Section({ title, children }) {
   return (
