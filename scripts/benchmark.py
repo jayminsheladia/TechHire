@@ -95,6 +95,20 @@ async def run_concurrency(base_url: str, total_requests: int, concurrency: int):
     return latencies, elapsed
 
 
+async def run_sweep(base_url: str, levels: list[int], requests_per_level: int):
+    rows = []
+    for c in levels:
+        latencies, elapsed = await run_concurrency(base_url, requests_per_level, c)
+        rows.append({
+            "concurrency": c,
+            "rps": len(latencies) / elapsed,
+            "mean": statistics.mean(latencies),
+            "p95": percentile(latencies, 95),
+            "p99": percentile(latencies, 99),
+        })
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark TechHire's /jobs endpoint")
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -102,6 +116,10 @@ def main():
     parser.add_argument("--warm-repeats", type=int, default=10, help="repeat hits per query for cache-warm sample")
     parser.add_argument("--requests", type=int, default=300, help="total requests for the concurrency test")
     parser.add_argument("--concurrency", type=int, default=30)
+    parser.add_argument("--sweep", action="store_true",
+                         help="run a concurrency sweep (10/50/100/200/300) instead of a single level")
+    parser.add_argument("--sweep-levels", default="10,50,100,200,300",
+                         help="comma-separated concurrency levels for --sweep")
     args = parser.parse_args()
 
     print(f"Target: {args.base_url}")
@@ -124,13 +142,24 @@ def main():
           f"({reduction:.0f}% latency reduction on repeat queries)")
 
     print("\n" + "=" * 70)
-    print(f"PART 2 — Concurrent throughput ({args.requests} requests, concurrency={args.concurrency})")
-    print("=" * 70)
 
-    latencies, elapsed = asyncio.run(run_concurrency(args.base_url, args.requests, args.concurrency))
-    rps = len(latencies) / elapsed
-    report(f"Concurrent GET /jobs (warm cache, {elapsed:.2f}s wall time)", latencies)
-    print(f"\n  => Throughput: {rps:.1f} requests/sec at concurrency={args.concurrency}")
+    if args.sweep:
+        levels = [int(x) for x in args.sweep_levels.split(",")]
+        print(f"PART 2 — Concurrency sweep ({levels}, {args.requests} requests/level)")
+        print("=" * 70)
+        rows = asyncio.run(run_sweep(args.base_url, levels, args.requests))
+        print(f"\n{'concurrency':>11} | {'req/s':>9} | {'mean ms':>8} | {'p95 ms':>8} | {'p99 ms':>8}")
+        print("-" * 58)
+        for row in rows:
+            print(f"{row['concurrency']:>11} | {row['rps']:>9.1f} | {row['mean']:>8.2f} | "
+                  f"{row['p95']:>8.2f} | {row['p99']:>8.2f}")
+    else:
+        print(f"PART 2 — Concurrent throughput ({args.requests} requests, concurrency={args.concurrency})")
+        print("=" * 70)
+        latencies, elapsed = asyncio.run(run_concurrency(args.base_url, args.requests, args.concurrency))
+        rps = len(latencies) / elapsed
+        report(f"Concurrent GET /jobs (warm cache, {elapsed:.2f}s wall time)", latencies)
+        print(f"\n  => Throughput: {rps:.1f} requests/sec at concurrency={args.concurrency}")
 
 
 if __name__ == "__main__":

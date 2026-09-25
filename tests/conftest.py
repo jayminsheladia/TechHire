@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from db.session import Base, DATABASE_URL as APP_DATABASE_URL
+from db.session import Base, DATABASE_URL as APP_DATABASE_URL, setup_schema
 from db.models import JobListing  # noqa: F401 — registers the table with Base
 
 
@@ -49,8 +49,11 @@ TestSessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 @pytest.fixture(scope="session", autouse=True)
 def _database():
     """Runs against TEST_DATABASE_URL (a dedicated *_test database), never
-    the app's own DATABASE_URL — see _test_database_url() above."""
-    Base.metadata.create_all(engine)
+    the app's own DATABASE_URL — see _test_database_url() above. Also runs
+    the same setup_schema() as init_db() (not just create_all()) — the
+    skills filter calls a custom SQL function, and the RAG tables need the
+    pgvector extension, so both must exist here too."""
+    setup_schema(engine)
     yield
     Base.metadata.drop_all(engine)
 

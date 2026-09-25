@@ -19,6 +19,7 @@ You'll need this repo pushed to GitHub (it already is) and accounts on the four 
 
 1. Create a project at neon.tech.
 2. Copy the connection string it gives you — it looks like `postgresql://user:pass@ep-xxxx.neon.tech/dbname?sslmode=require`.
+3. Nothing to enable by hand for RAG: Neon ships the `pgvector` extension, and the API runs `CREATE EXTENSION IF NOT EXISTS vector` on startup.
 3. Keep this — it's your production `DATABASE_URL`.
 
 ---
@@ -99,3 +100,11 @@ DATABASE_URL="<your Neon connection string>" python main.py
 ```
 
 This alone gets you ~1,000 real postings from real companies (Stripe, OpenAI, Databricks, Palantir, Ramp, and others — see `scraper/runner.py`'s `SCRAPE_CONFIGS` for the full list). Add `RAPIDAPI_KEY` too if you also want the broader keyword-search coverage from JSearch (Indeed/Glassdoor/Handshake) — optional, not required to have real data in production.
+
+`main.py` also builds the RAG index (chunks + embeddings for "Ask TechHire" and similar roles) as its last step — about 3–4 minutes of CPU for ~1,000 postings the first time, then only new or changed postings on later runs. To (re)build just the index:
+
+```bash
+DATABASE_URL="<your Neon connection string>" python scripts/build_rag_index.py
+```
+
+> Memory: the API keeps the embedding model loaded after the first RAG request. Measured locally: ~110 MB for the API alone, ~300 MB peak once the model is loaded (ONNX Runtime adds ~190 MB). That fits Render's free 512 MB instance, but with less headroom than before — the model is the largest single chunk of the API's memory.
