@@ -212,11 +212,11 @@ See [.env.example](.env.example) for the full template.
 
 ## Performance
 
-An early benchmark at real-world data volume (1,037 real scraped postings) surfaced two concrete bottlenecks: every filter query did a full table scan (no index covered `title`/`company`/`required_skills`), and the list endpoint shipped each job's full description/responsibilities/qualifications/benefits even though the list UI never renders them. Both are fixed in the code; the numbers below are measured before/after on the **same 50,040-row dataset** (1,040 real Greenhouse/Lever/Ashby postings + 49,000 synthetic, `docker compose` on an Apple M-series laptop), not cherry-picked runs.
+All numbers: **50,040-row dataset** (1,040 real Greenhouse/Lever/Ashby postings + 49,000 synthetic), Postgres/Redis/API under `docker compose` on an Apple M-series laptop. Query timings are the median of 5 warm runs. Everything here was re-measured after I found problems in the first round of numbers; see [what the first benchmark got wrong](#what-the-first-benchmark-got-wrong).
 
-### 1. Indexing — the biggest win
+### 1. Trigram indexes for the text filters
 
-`_build_query()`'s `search` and `skills` filters run as `ILIKE '%term%'`, which a plain B-tree index can't accelerate. Added trigram GIN indexes (`pg_trgm`) on `lower(title)`, `lower(company)`, and the skills expression, matching the exact predicates the query already uses — no query-behavior change, purely additive (`db/session.py`):
+`_build_query()`'s `search` and `skills` filters run as `LIKE '%term%'`, which a plain B-tree index can't accelerate. I added trigram GIN indexes (`pg_trgm`) on `lower(title)`, `lower(company)` and the skills expression, matching the exact predicates the query already uses (`db/session.py`):
 
 ```sql
 CREATE INDEX ix_job_listings_title_trgm   ON job_listings USING gin (lower(title) gin_trgm_ops);
@@ -224,58 +224,69 @@ CREATE INDEX ix_job_listings_company_trgm ON job_listings USING gin (lower(compa
 CREATE INDEX ix_job_listings_skills_trgm  ON job_listings USING gin (immutable_array_to_string(required_skills, ',') gin_trgm_ops);
 ```
 
-(`required_skills` is a Postgres array — indexing `array_to_string(...)` directly isn't allowed since Postgres marks that function `STABLE`, not `IMMUTABLE`; worked around it with a one-line SQL wrapper function declared `IMMUTABLE`, and pointed the app's query at that same wrapper so the planner matches it to the index.)
+(`required_skills` is a Postgres array, and `array_to_string()` can't be indexed because Postgres marks it `STABLE`, not `IMMUTABLE`. I wrapped it in a one-line SQL function declared `IMMUTABLE` and pointed the app's query at the same wrapper, so the planner matches it to the index.)
 
-`EXPLAIN (ANALYZE, BUFFERS)`, identical queries, before vs. after — `Seq Scan` → `Bitmap Index Scan`:
+`EXPLAIN ANALYZE`, `SELECT *` with the same predicates, sequential scan forced vs. index allowed:
 
-| Query | Before (Seq Scan) | After (Index Scan) | Speedup |
-|---|---|---|---|
-| `company ILIKE '%stripe%'` (1,669 rows) | 19.6ms | 9.9ms | 2.0x |
-| `title ILIKE '%security%'` (2,849 rows) | 15.5ms | 9.7ms | 1.6x |
-| `skills ILIKE '%kubernetes%'` (7,446 rows) | 38.3ms | 25.6ms | 1.5x |
-| **`company='databricks' AND skill='rust'` (256 rows)** | **47.7ms** | **5.6ms** | **8.5x** |
+| Filter | Matching rows | Seq scan | With index | Speedup |
+|---|---|---|---|---|
+| `company` contains "stripe" | 1,669 | 14.5 ms | 1.5 ms | **9.9x** |
+| `title` contains "security" | 2,849 | 15.5 ms | 2.5 ms | **6.2x** |
+| `skills` contains "kubernetes" | 7,446 | 23.1 ms | 13.5 ms | 1.7x |
+| `company` "databricks" AND `skills` "rust" | 256 | 8.5 ms | 4.3 ms | 2.0x |
 
-The single-filter cases are only 1.5–2x because the result sets are large (thousands of rows) — most of the time is spent fetching matching rows off disk (`Bitmap Heap Scan`), which an index can't shrink. The realistic case — a user stacking multiple filters, like the sidebar UI actually lets them do — is the one that matters, and it's the one where a wide table stops requiring a full scan: **8.5x faster** once the index narrows it to a bitmap of 256 rows before touching the heap.
+The index helps most when it can skip most of the table on short text columns. The skills filter gains least: it matches 7,446 rows (15% of the table), so fetching those rows dominates either way. The combined filter is already fairly cheap without an index, because the sequential scan checks the cheap `company` predicate first and skips the expensive skills expression for the 96.4% of rows that fail it.
 
 ### 2. Trimming the list payload
 
-`GET /jobs` no longer returns `description`/`responsibilities`/`qualifications`/`benefits` — only `GET /jobs/{id}` (the detail view, which is what actually renders them) does. The frontend's `SlideOver` panel now fetches the full record on open instead of assuming the list item already had it.
+`GET /jobs` no longer returns `description`/`responsibilities`/`qualifications`/`benefits`; only `GET /jobs/{id}` (the detail view, the only place they're rendered) does. The frontend's slide-over fetches the full record when it opens.
 
-A single full job record is ~4.3KB; a trimmed list page of 20 jobs is 11.5KB — vs. an estimated ~87KB if all 20 carried full detail. **~87% smaller list payload.**
+Measured on 20 real postings: **12.3 KB trimmed vs 123 KB full, 90% smaller** (a real posting averages 6 KB in full). The default first page is synthetic rows with short descriptions, where it's 55%.
 
-### 3. Redis caching, at scale
+### 3. Redis caching
 
-Same cache design as before (45s TTL on `GET /jobs`), now measured against the indexed, trimmed, 50k-row table instead of a 1k-row one:
+45 s TTL on `GET /jobs`. Part 1 of `scripts/benchmark.py`: 24 distinct filter combinations, each requested once (miss) and then 10 more times (hits), with the cache flushed first:
 
-| | Cache MISS (Postgres) | Cache HIT (Redis) |
+| | Cache miss (Postgres) | Cache hit (Redis) |
 |---|---|---|
-| Mean latency | 18.57ms | 1.25ms |
-| p95 latency | 23.09ms | 1.63ms |
+| Mean | 19.1 ms | 1.38 ms |
+| p95 | 23.8 ms | 1.79 ms |
 
-**14.9x faster (93% latency reduction)** — a much bigger win than the 2.1x measured at 1k rows, because the miss path now does real, non-trivial work (even with the index, it's still a bitmap scan + heap fetch over tens of thousands of rows) that the cache is actually saving. This is the more honest, more production-representative number.
+**13.8x faster on a hit (93% lower latency).** Note what the misses measure: the benchmark varies `work_mode`, `experience_level` and sort order, which the trigram indexes don't cover. So a miss here is a full scan, sort and count over 50k rows, and the cache is saving exactly that. At 1k rows, the same cache gave 2.1x (5.81 → 2.81 ms); the win grows with how much work a miss has to do.
 
-### 4. Concurrency sweep
+### 4. Throughput
 
-`python scripts/benchmark.py --sweep` fires increasing concurrent load at a warm cache:
+Measured with ApacheBench (`ab -k`), cached query, one uvicorn worker in Docker:
 
-| Concurrency | req/s | mean | p95 | p99 |
-|---|---|---|---|---|
-| 10 | 1,268 | 7.6ms | 15.1ms | 20.1ms |
-| 50 | 1,043 | 45.1ms | 56.4ms | 60.0ms |
-| 100 | 1,161 | 76.1ms | 95.2ms | 123.7ms |
-| 150 | 757 | 174.7ms | 267.5ms | 368.1ms |
-| 200 | 927 | 172.0ms | 399.8ms | 412.8ms |
-| 300 | 978 | 204.3ms | 379.7ms | 385.8ms |
+| Concurrent connections | req/s | Mean | p99 |
+|---|---|---|---|
+| 1 | 670 | 1.5 ms | 3 ms |
+| 10 | 1,293 | 7.7 ms | 14 ms |
+| 50 | 1,280 | 39.1 ms | 61 ms |
+| 100 | 1,277 | 78.3 ms | 100 ms |
+| 200 | 1,277 | 156.7 ms | 179 ms |
 
-Throughput holds in the ~1,000–1,200 req/s range through 100 concurrent connections; latency then climbs sharply and throughput gets noticeably noisier beyond that. The most likely cause: `GET /jobs` is a synchronous (`def`, not `async def`) route handler, which FastAPI runs in a bounded worker thread pool (Starlette/anyio's default sync-endpoint limiter caps around 40 threads) — past that, requests queue behind the thread pool instead of the database or Redis, which is consistent with where the curve bends. Not fixed here (would mean an async DB driver, e.g. `asyncpg`), but this is exactly the kind of thing a load test is supposed to surface: not just "is it fast," but "where does it actually break, and why."
+One worker saturates at **~1,280 req/s** from about 10 connections up, and past that point additional load only queues. Latency grows linearly, exactly as Little's law predicts (100 connections ÷ 1,277 req/s = 78 ms; 78.3 ms measured), with no errors and no collapse up to 200 connections. The ceiling is one Python process: 1 / 1,280 req/s ≈ 0.8 ms of serial work per request (routing, Redis round-trip, decoding and re-encoding the cached JSON), and one process gets one core under the interpreter lock. I haven't profiled how that 0.8 ms splits.
+
+It scales with processes. Run natively with ApacheBench at 100 connections: **1 worker 1,624 req/s (p99 93 ms) vs 4 workers 4,109 req/s (p99 50 ms), 2.5x.** uvicorn reads its worker count from `WEB_CONCURRENCY`. The Docker image keeps the default of 1, because each worker that serves a RAG request also loads its own ~190 MB embedding model, and four of those don't fit a 512 MB free-tier instance. Also note that `/scrape/status` is held in process memory, so with several workers it reflects whichever worker answers.
+
+### What the first benchmark got wrong
+
+The first version of this section said the cache miss path was an index scan, and that throughput "breaks past ~100 connections because of the 40-thread sync-endpoint pool". Neither held up:
+
+- **The miss path never touched the new indexes** (see section 3).
+- **The concurrency numbers above 100 were the client's.** httpx caps an `AsyncClient` at 100 connections, so higher "concurrency" was queueing inside the benchmark. Lifting the cap made the Python client itself the bottleneck: its throughput fell to ~350 req/s at 50 connections, with zero cache misses on the server. The same test with ApacheBench showed a flat ~1,280 req/s, which is how I knew it was the client. The script now lifts the cap and documents its ceiling, and throughput numbers come from `ab`.
+- **The original index table didn't reproduce.** Re-measured as medians of 5 warm runs, the pattern flipped: single-column filters gain most (6–10x) and the combined filter least (2x), the opposite of the original "8.5x on the combined filter" claim.
 
 ### Reproduce it
 
 ```bash
 docker compose up -d
-python main.py                                  # real postings via Greenhouse/Lever/Ashby
-python scripts/seed_synthetic_jobs.py --count 49000   # scale up for a meaningful index benefit
-python scripts/benchmark.py --sweep
+python main.py                                        # real postings via Greenhouse/Lever/Ashby
+python scripts/seed_synthetic_jobs.py --count 49000   # scale up to ~50k rows
+docker exec techhire_redis sh -c "redis-cli --scan --pattern 'jobs:*' | xargs -r redis-cli del"
+python scripts/benchmark.py                           # cache miss vs hit latency
+ab -k -n 8000 -c 100 'http://127.0.0.1:8000/jobs?page=1&page_size=20&sort=newest'
 ```
 
 ---
@@ -428,7 +439,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for a step-by-step guide to deploying the fro
 - Frontend test coverage
 - LLM-as-judge faithfulness check for RAG answers (citations are verified to exist, not yet to support their sentence)
 - Cross-encoder reranking of the fused candidates before they reach the LLM
-- Async DB driver (`asyncpg`) — the concurrency sweep in [Performance](#performance) points to the sync-endpoint thread pool as the next real bottleneck past ~100 concurrent requests
+- Profile the cache-hit path, and try serving the cached JSON bytes as-is instead of decoding and re-encoding them on every hit. Per-request Python work is what caps one worker at ~1,280 req/s (see [Throughput](#4-throughput))
 
 ---
 

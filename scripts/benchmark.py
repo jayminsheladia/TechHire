@@ -5,6 +5,17 @@ docker-compose stack on localhost).
 Usage:
     python scripts/benchmark.py
     python scripts/benchmark.py --base-url http://localhost:8000 --concurrency 50 --requests 500
+
+Part 1 (cache miss vs hit latency) is sequential and trustworthy. Run it
+right after flushing the cache (or >45 s after the last run), otherwise
+the "miss" queries are already cached.
+
+Part 2 (throughput) has a ceiling of its own: this is a single Python
+asyncio process, and it tops out around ~1,300 req/s on an M-series
+laptop, degrading as concurrency rises past ~25. Above that it measures
+the client, not the server. For server throughput, use a native load
+generator, e.g. ApacheBench:
+    ab -k -n 8000 -c 100 'http://127.0.0.1:8000/jobs?page=1&page_size=20&sort=newest'
 """
 import argparse
 import asyncio
@@ -75,7 +86,11 @@ async def run_concurrency(base_url: str, total_requests: int, concurrency: int):
     params = {"page": 1, "page_size": 20, "sort": "newest"}
     latencies = []
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    # httpx caps an AsyncClient at 100 connections by default. Without
+    # lifting that, any concurrency above 100 just queues inside this
+    # client and the "server" latency measured is really client-side wait.
+    limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    async with httpx.AsyncClient(timeout=30, limits=limits) as client:
         # Warm the cache for this query before measuring concurrent throughput.
         await client.get(f"{base_url}/jobs", params=params)
 
@@ -98,9 +113,13 @@ async def run_concurrency(base_url: str, total_requests: int, concurrency: int):
 async def run_sweep(base_url: str, levels: list[int], requests_per_level: int):
     rows = []
     for c in levels:
-        latencies, elapsed = await run_concurrency(base_url, requests_per_level, c)
+        # At least 20 requests per connection, so each level runs for a
+        # meaningful stretch instead of one ~0.3 s burst.
+        n = max(requests_per_level, 20 * c)
+        latencies, elapsed = await run_concurrency(base_url, n, c)
         rows.append({
             "concurrency": c,
+            "requests": n,
             "rps": len(latencies) / elapsed,
             "mean": statistics.mean(latencies),
             "p95": percentile(latencies, 95),
@@ -117,8 +136,8 @@ def main():
     parser.add_argument("--requests", type=int, default=300, help="total requests for the concurrency test")
     parser.add_argument("--concurrency", type=int, default=30)
     parser.add_argument("--sweep", action="store_true",
-                         help="run a concurrency sweep (10/50/100/200/300) instead of a single level")
-    parser.add_argument("--sweep-levels", default="10,50,100,200,300",
+                         help="run a concurrency sweep instead of a single level")
+    parser.add_argument("--sweep-levels", default="1,5,10,25,50,100,200",
                          help="comma-separated concurrency levels for --sweep")
     args = parser.parse_args()
 
@@ -145,13 +164,13 @@ def main():
 
     if args.sweep:
         levels = [int(x) for x in args.sweep_levels.split(",")]
-        print(f"PART 2 — Concurrency sweep ({levels}, {args.requests} requests/level)")
+        print(f"PART 2 — Concurrency sweep ({levels}, >= {args.requests} requests/level)")
         print("=" * 70)
         rows = asyncio.run(run_sweep(args.base_url, levels, args.requests))
-        print(f"\n{'concurrency':>11} | {'req/s':>9} | {'mean ms':>8} | {'p95 ms':>8} | {'p99 ms':>8}")
-        print("-" * 58)
+        print(f"\n{'concurrency':>11} | {'requests':>8} | {'req/s':>9} | {'mean ms':>8} | {'p95 ms':>8} | {'p99 ms':>8}")
+        print("-" * 69)
         for row in rows:
-            print(f"{row['concurrency']:>11} | {row['rps']:>9.1f} | {row['mean']:>8.2f} | "
+            print(f"{row['concurrency']:>11} | {row['requests']:>8} | {row['rps']:>9.1f} | {row['mean']:>8.2f} | "
                   f"{row['p95']:>8.2f} | {row['p99']:>8.2f}")
     else:
         print(f"PART 2 — Concurrent throughput ({args.requests} requests, concurrency={args.concurrency})")
