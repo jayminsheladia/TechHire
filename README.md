@@ -210,6 +210,13 @@ Three runs, same machine (Docker Compose, Apple M-series laptop), increasing rea
 | 22 hand-written demo jobs | 3.40ms | 0.93ms | 3.7x | ~684 req/s |
 | 5,022 synthetic jobs | 4.08ms | 1.44ms | 2.8x | ~910 req/s |
 | **1,037 real postings** (Greenhouse/Lever/Ashby) | **5.81ms** | **2.81ms** | **2.1x** | **~498 req/s** |
+| 1,547 real postings — independent re-run, later date | 5.71ms | 2.65ms | 2.2x | ~417 req/s |
+
+The last row is a reproduction run on a separately scraped dataset (the ATS boards return
+different postings on different days), kept here because it is the only evidence that the row
+above isn't a one-off. Latency landed within 0.2ms on both measures despite 50% more rows.
+Throughput dropped ~16%, consistent with the per-request serialization explanation below —
+more rows of multi-KB job descriptions, same fixed cost per response.
 
 The real-data run is the one that matters, and it tells an honest, slightly less flattering story than the synthetic one: throughput went *down* even though row count went *down* too, because real job descriptions are large (full text, arrays of qualifications/responsibilities/benefits — multiple KB per row), so both the Postgres row size and the JSON (de)serialization cost per request are meaningfully higher than synthetic filler data. The cache's relative win also shrank (2.1x vs 2.8x) for the same reason — caching helps less when the *fixed* per-request serialization cost dominates over the *variable* query-execution cost it's actually saving.
 

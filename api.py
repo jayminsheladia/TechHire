@@ -330,7 +330,7 @@ _VARIANTS = [
         "Be specific. No filler.",
     ),
     (
-        "qwen/qwen3.6-27b",         # different model — fit & growth angle
+        "qwen/qwen3.8-27b",         # different model — fit & growth angle
         "Summarize this job in exactly 3 short paragraphs:\n"
         "Paragraph 1: What makes this company and role interesting — product, scale, or mission.\n"
         "Paragraph 2: What a typical week looks like — responsibilities and tech used.\n"
@@ -350,7 +350,7 @@ _VARIANTS = [
 
 
 def _reasoning_kwargs(model: str) -> dict:
-    """Groq's current chat models (gpt-oss, qwen3.6) are reasoning models by
+    """Groq's current chat models (gpt-oss, qwen3.8) are reasoning models by
     default — left alone, they spend max_tokens on invisible chain-of-thought
     and can return empty content. Pin them to minimal/no reasoning so
     max_tokens goes to the actual answer instead. Param names/values are
