@@ -12,7 +12,10 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15-alpine
+        # pgvector for the RAG tables. Debian-based, unlike the local
+        # image (db/docker/Dockerfile) — fine here, since CI always starts
+        # from an empty database.
+        image: pgvector/pgvector:pg15
         env:
           POSTGRES_USER: techhire
           POSTGRES_PASSWORD: localdev

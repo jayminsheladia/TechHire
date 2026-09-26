@@ -3,18 +3,23 @@ import asyncio
 import json as json_lib
 import re as re_module
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, or_, and_, func, text
 from dotenv import load_dotenv
 from db.session import init_db, SessionLocal
-from db.models import JobListing
+from db.models import JobListing, JobVector
 from scraper.runner import refresh as run_refresh
 from core.redis_client import get_redis
 from core.cache import jobs_cache_key, cache_get, cache_set, cache_clear_prefix
 from core.ratelimit import get_client_ip, rate_limit, cooldown
+from ai.llm import configured_groq_key, reasoning_kwargs, make_groq_llm
+from ai.summary_graph import build_summary_graph
+from ai.answer_graph import build_answer_graph
+from rag.retrieval import SEARCHERS, diversify, hybrid_search, similar_jobs
 
 load_dotenv()
 
@@ -36,22 +41,18 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 JOBS_CACHE_TTL = 45  # seconds
 
 
-def _configured_groq_key() -> Optional[str]:
-    """Returns GROQ_API_KEY, or None if it's unset or still a placeholder
-    value (any '.env.example' entry starts with 'your_')."""
-    api_key = os.getenv("GROQ_API_KEY", "")
-    if not api_key or api_key.startswith("your_"):
-        return None
-    return api_key
-
-
 @app.on_event("startup")
 def startup():
     init_db()
 
 
-def _job_to_dict(j: JobListing) -> dict:
-    return {
+def _job_to_dict(j: JobListing, full: bool = False) -> dict:
+    """`full=False` (used by the list endpoint) omits the heavy free-text
+    fields — description/responsibilities/qualifications/benefits can run
+    several KB per row and aren't rendered in the list view, so shipping
+    them on every /jobs page multiplies payload size for no UI benefit.
+    The detail endpoint (`full=True`) still returns everything."""
+    d = {
         "id": j.id,
         "source_job_id": j.source_job_id,
         "title": j.title,
@@ -67,10 +68,6 @@ def _job_to_dict(j: JobListing) -> dict:
         "work_mode": j.work_mode,
         "job_type": j.job_type,
         "experience_level": j.experience_level,
-        "description": j.description,
-        "responsibilities": j.responsibilities or [],
-        "qualifications": j.qualifications or [],
-        "benefits": j.benefits or [],
         "required_skills": j.required_skills or [],
         "salary_min": j.salary_min,
         "salary_max": j.salary_max,
@@ -79,6 +76,12 @@ def _job_to_dict(j: JobListing) -> dict:
         "visa_sponsorship": j.visa_sponsorship,
         "start_date_text": j.start_date_text,
     }
+    if full:
+        d["description"] = j.description
+        d["responsibilities"] = j.responsibilities or []
+        d["qualifications"] = j.qualifications or []
+        d["benefits"] = j.benefits or []
+    return d
 
 
 def _build_query(
@@ -98,8 +101,11 @@ def _build_query(
 
     if skills:
         for skill in skills:
+            # Uses the same IMMUTABLE wrapper the trigram index in
+            # db/session.py is built on, so this stays index-backed —
+            # the built-in array_to_string() can't be indexed directly.
             stmt = stmt.where(
-                func.array_to_string(JobListing.required_skills, ",").ilike(
+                func.immutable_array_to_string(JobListing.required_skills, ",").ilike(
                     f"%{skill.lower()}%"
                 )
             )
@@ -215,7 +221,7 @@ def get_job(job_id: int):
         j = session.get(JobListing, job_id)
         if not j:
             raise HTTPException(status_code=404, detail="Job not found")
-        return _job_to_dict(j)
+        return _job_to_dict(j, full=True)
 
 
 # ── Refresh (incremental scrape) ────────────────────────────────────────────
@@ -309,122 +315,14 @@ def _build_job_context(j: JobListing) -> str:
     return "\n".join(parts)
 
 
-_SYSTEM = (
-    "You are a concise career advisor helping CS Masters students and new grad "
-    "engineers quickly evaluate job postings. Write clearly, avoid filler phrases "
-    "like 'this is a great opportunity', and always include concrete details "
-    "(tech stack, salary, experience requirements if mentioned). "
-    "Output only the requested paragraphs — no headers, no bullet points, no preamble."
-)
-
-# Three different models (all free on Groq) covering different angles.
-# Groq's currently available chat models are reasoning models by default —
-# see _reasoning_kwargs() below for why every call needs extra params.
-_VARIANTS = [
-    (
-        "openai/gpt-oss-120b",      # best quality — role & day-to-day
-        "Summarize this job in exactly 3 short paragraphs for a CS Masters student:\n"
-        "Paragraph 1: What the company does and what this role is about.\n"
-        "Paragraph 2: What you will actually build or do day-to-day, and the tech stack.\n"
-        "Paragraph 3: What they require — years of experience and must-have skills.\n"
-        "Be specific. No filler.",
-    ),
-    (
-        "qwen/qwen3.8-27b",         # different model — fit & growth angle
-        "Summarize this job in exactly 3 short paragraphs:\n"
-        "Paragraph 1: What makes this company and role interesting — product, scale, or mission.\n"
-        "Paragraph 2: What a typical week looks like — responsibilities and tech used.\n"
-        "Paragraph 3: Who is the ideal candidate — skills, background, experience level. "
-        "Mention salary and visa if available.\n"
-        "Keep it tight.",
-    ),
-    (
-        "openai/gpt-oss-20b",       # fastest — practical / student-focused
-        "Summarize this job posting in exactly 3 short paragraphs for someone deciding whether to apply:\n"
-        "Paragraph 1: One-sentence pitch — role + company + why it matters.\n"
-        "Paragraph 2: The core technical work and stack they will use.\n"
-        "Paragraph 3: Requirements and what you get — salary, remote/hybrid, visa, perks.\n"
-        "Be direct. Students want facts, not marketing.",
-    ),
-]
-
-
-def _reasoning_kwargs(model: str) -> dict:
-    """Groq's current chat models (gpt-oss, qwen3.8) are reasoning models by
-    default — left alone, they spend max_tokens on invisible chain-of-thought
-    and can return empty content. Pin them to minimal/no reasoning so
-    max_tokens goes to the actual answer instead. Param names/values are
-    model-family-specific per Groq's API."""
-    if model.startswith("openai/gpt-oss"):
-        return {"reasoning_effort": "low", "reasoning_format": "hidden"}
-    if model.startswith("qwen/"):
-        return {"reasoning_effort": "none"}
-    return {}
-
-_SYNTHESIS_PROMPT = (
-    "Three different AI models each summarized the same job posting from a different angle. "
-    "Read all three summaries, then write the single best 3-paragraph summary that combines "
-    "the strongest, most specific information from each:\n\n"
-    "Paragraph 1: Company context and what this role is (2-3 sentences).\n"
-    "Paragraph 2: Day-to-day work, tech stack, and what you will build.\n"
-    "Paragraph 3: Requirements (skills, experience level) and compensation "
-    "(salary, visa sponsorship, work mode).\n\n"
-    "Rules: include actual numbers and tech names from the originals. No filler. "
-    "Output only the 3 paragraphs separated by blank lines — nothing else."
-)
-
-
-async def _call_groq(client, model: str, prompt: str, context: str) -> str:
-    loop = asyncio.get_event_loop()
-    def _sync():
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=600,
-            temperature=0.4,
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": f"{prompt}\n\n---JOB---\n{context}"},
-            ],
-            **_reasoning_kwargs(model),
-        )
-        return (resp.choices[0].message.content or "").strip()
-    return await loop.run_in_executor(None, _sync)
-
-
-_SYNTHESIS_MODEL = "openai/gpt-oss-120b"
-
-
-async def _synthesize_groq(client, summaries: list[str], context: str) -> str:
-    numbered = "\n\n".join(
-        f"[Model {i+1} — {name}]\n{s}"
-        for i, ((name, _), s) in enumerate(zip(_VARIANTS, summaries))
-    )
-    loop = asyncio.get_event_loop()
-    def _sync():
-        resp = client.chat.completions.create(
-            model=_SYNTHESIS_MODEL,
-            max_tokens=800,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{_SYNTHESIS_PROMPT}\n\n"
-                        f"--- THREE MODEL SUMMARIES ---\n{numbered}\n\n"
-                        f"--- ORIGINAL JOB (reference) ---\n{context[:1500]}"
-                    ),
-                },
-            ],
-            **_reasoning_kwargs(_SYNTHESIS_MODEL),
-        )
-        return (resp.choices[0].message.content or "").strip()
-    return await loop.run_in_executor(None, _sync)
+@lru_cache(maxsize=1)
+def _summary_graph(api_key: str):
+    return build_summary_graph(make_groq_llm(api_key))
 
 
 @app.get("/jobs/{job_id}/summary")
 async def get_job_summary(job_id: int, refresh: bool = False):
-    api_key = _configured_groq_key()
+    api_key = configured_groq_key()
     if not api_key:
         raise HTTPException(
             status_code=503,
@@ -442,27 +340,107 @@ async def get_job_summary(job_id: int, refresh: bool = False):
         if not j.description:
             raise HTTPException(status_code=422, detail="No description to summarize")
 
-        from groq import Groq
-        client = Groq(api_key=api_key)
-        context = _build_job_context(j)
-
-        # Run 3 different models concurrently
-        summaries = await asyncio.gather(*[
-            _call_groq(client, model, prompt, context)
-            for model, prompt in _VARIANTS
-        ])
-
-        # Synthesize with the best model
-        final = await _synthesize_groq(client, list(summaries), context)
+        # 3 models in parallel → synthesis, degrading gracefully if some of
+        # them fail — see ai/summary_graph.py.
+        result = await _summary_graph(api_key).ainvoke({"context": _build_job_context(j)})
+        if result["strategy"] == "failed":
+            raise HTTPException(status_code=502, detail=f"All summary models failed — {result['error']}")
 
         # Cache in DB
         session.execute(
             text("UPDATE job_listings SET ai_summary = :s WHERE id = :id"),
-            {"s": final, "id": job_id}
+            {"s": result["summary"], "id": job_id}
         )
         session.commit()
 
-        return {"summary": final, "cached": False}
+        return {
+            "summary": result["summary"],
+            "cached": False,
+            "strategy": result["strategy"],
+            "drafts": [
+                {"model": d["model"], "ok": d["text"] is not None, "seconds": d["seconds"], "error": d["error"]}
+                for d in result["drafts"]
+            ],
+        }
+
+
+# ── RAG: similar roles, search, grounded Q&A ────────────────────────────────
+
+RAG_CANDIDATES = 30       # fused hybrid hits considered...
+RAG_CONTEXT_CHUNKS = 8    # ...of which at most this many reach the LLM
+
+
+def _rag_retrieve(question: str) -> list[dict]:
+    with SessionLocal() as session:
+        hits = hybrid_search(session, question, k=RAG_CANDIDATES)
+    return [h.to_dict() for h in diversify(hits, per_job=2, k=RAG_CONTEXT_CHUNKS)]
+
+
+@lru_cache(maxsize=1)
+def _answer_graph(api_key: str):
+    return build_answer_graph(make_groq_llm(api_key), _rag_retrieve)
+
+
+@app.get("/jobs/{job_id}/similar")
+def get_similar_jobs(
+    job_id: int,
+    k: int = Query(default=6, ge=1, le=20),
+    same_company: bool = Query(default=False),
+):
+    with SessionLocal() as session:
+        if not session.get(JobListing, job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        # Synthetic rows and postings scraped since the last index build
+        # have no vector yet — say so rather than returning a silent [].
+        if not session.get(JobVector, job_id):
+            return {"indexed": False, "similar": []}
+        return {"indexed": True, "similar": similar_jobs(session, job_id, k, same_company)}
+
+
+@app.get("/rag/search")
+def rag_search(
+    q: str = Query(min_length=2, max_length=300),
+    mode: str = Query(default="hybrid", pattern="^(dense|lexical|hybrid)$"),
+    k: int = Query(default=10, ge=1, le=50),
+):
+    """Retrieval only, no LLM — for inspecting what each retriever returns."""
+    with SessionLocal() as session:
+        hits = SEARCHERS[mode](session, q, k)
+    return {"mode": mode, "results": [h.to_dict() for h in hits]}
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/rag/ask")
+async def rag_ask(req: AskRequest, request: Request):
+    api_key = configured_groq_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
+
+    client_ip = get_client_ip(request)
+    allowed, retry_after = rate_limit(get_redis(), f"ratelimit:rag-ask:{client_ip}", limit=10, window_seconds=600)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"Too many questions — try again in {retry_after}s")
+
+    # retrieve → generate → check citations (→ retry once) — see ai/answer_graph.py
+    state = await _answer_graph(api_key).ainvoke({"question": req.question.strip()})
+    if state["status"] == "error":
+        # Most often Groq's free-tier tokens-per-minute cap on the answer model.
+        raise HTTPException(status_code=503, detail="The answer model is unavailable right now "
+                                                    "(likely rate-limited) — try again in a minute.")
+    cited = set(state.get("cited", []))
+    return {
+        "answer": state["answer"],
+        "status": state["status"],
+        "attempts": state.get("attempts", 0),
+        "sources": [
+            {"n": n, "job_id": s["job_id"], "title": s["title"], "company": s["company"],
+             "url": s["url"], "section": s["section"], "snippet": s["body"], "cited": n in cited}
+            for n, s in enumerate(state.get("sources", []), start=1)
+        ],
+    }
 
 
 # ── Resume PDF extraction ────────────────────────────────────────────────────
@@ -593,7 +571,7 @@ def _extract_json(text: str) -> dict:
 
 @app.post("/resume/analyze")
 async def analyze_resume(req: ResumeRequest, request: Request):
-    api_key = _configured_groq_key()
+    api_key = configured_groq_key()
     if not api_key:
         raise HTTPException(503, "GROQ_API_KEY not configured — add it to .env")
 
@@ -635,7 +613,7 @@ async def analyze_resume(req: ResumeRequest, request: Request):
                 {"role": "system", "content": _RESUME_SYSTEM},
                 {"role": "user",   "content": prompt},
             ],
-            **_reasoning_kwargs(model),
+            **reasoning_kwargs(model),
         )
         return (resp.choices[0].message.content or "").strip()
 

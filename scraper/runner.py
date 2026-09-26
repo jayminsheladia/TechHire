@@ -99,6 +99,18 @@ def _scrape_all(existing_ids: set[str]) -> tuple[list, dict[str, int], bool]:
     return all_jobs, source_counts, quota_exceeded
 
 
+def _update_rag_index(log=lambda *_: None) -> dict:
+    """Embed new/changed postings for RAG (only the diff — see rag/indexer.py).
+    A failure here must not fail the scrape: listing and search still work,
+    only RAG results lag until the next successful index run."""
+    try:
+        from rag.indexer import index_jobs
+        with SessionLocal() as session:
+            return index_jobs(session, log=log)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def run():
     """Full scrape — used for the CLI / cron. Still skips jobs we already
     have (via existing_ids early-stop) so re-running isn't wasteful."""
@@ -130,6 +142,9 @@ def run():
     print("\nReparsing fields on all jobs...")
     reparse_result = reparse_all()
     print(f"  ✓ Reparsed: {reparse_result['updated']} updated, {reparse_result['unchanged']} unchanged")
+
+    print("\nUpdating RAG index...")
+    print(f"  {_update_rag_index(log=lambda msg: print(f'  {msg}'))}")
     print(f"\nDone.\n")
 
 
@@ -159,6 +174,7 @@ def refresh() -> dict:
         "sources": source_counts,
         "quota_exceeded": quota_exceeded,
         "reparsed": reparse_result["updated"],
+        "rag_index": _update_rag_index(),
     }
 
 

@@ -1,6 +1,10 @@
 services:
   ddb:
-    image: postgres:15-alpine
+    # postgres:15-alpine + pgvector (see db/docker/Dockerfile for why it's
+    # built from source instead of using the pgvector/pgvector image)
+    build:
+      context: ./db/docker
+    image: techhire-postgres-pgvector
     container_name: techhire_db
     environment:
       POSTGRES_USER: techhire
