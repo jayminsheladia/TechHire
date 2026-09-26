@@ -252,7 +252,7 @@ Measured on 20 real postings: **12.3 KB trimmed vs 123 KB full, 90% smaller** (a
 | Mean | 19.1 ms | 1.38 ms |
 | p95 | 23.8 ms | 1.79 ms |
 
-**13.8x faster on a hit (93% lower latency).** Note what the misses measure: the benchmark varies `work_mode`, `experience_level` and sort order, which the trigram indexes don't cover. So a miss here is a full scan, sort and count over 50k rows, and the cache is saving exactly that. At 1k rows, the same cache gave 2.1x (5.81 → 2.81 ms); the win grows with how much work a miss has to do.
+**13.8x faster on a hit (93% lower latency).** Note what the misses measure: the benchmark varies `work_mode`, `experience_level` and sort order, which the trigram indexes don't cover. So a miss here is a full scan, sort and count over 50k rows, and the cache is saving exactly that. At ~1k rows, the same cache gave 2.1x (5.81 → 2.81 ms on 1,037 real postings), reproduced on a separately scraped 1,547-posting set at 2.2x (5.71 → 2.65 ms). The win grows with how much work a miss has to do. (Those earlier runs also reported ~420–500 req/s at 40 connections, but that was measured with the Python client, which [turned out to be the bottleneck](#what-the-first-benchmark-got-wrong) at that concurrency.)
 
 ### 4. Throughput
 
